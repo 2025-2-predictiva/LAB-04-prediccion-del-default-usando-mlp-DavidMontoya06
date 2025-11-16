@@ -96,3 +96,212 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import json
+import gzip
+import pickle
+from glob import glob
+from pathlib import Path
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+
+def _cargar_y_limpia(ruta_zip: str) -> pd.DataFrame:
+    """
+    Carga y limpia datos desde un archivo ZIP.
+    
+    Args:
+        ruta_zip: Ruta al archivo CSV comprimido en ZIP
+        
+    Returns:
+        DataFrame limpio sin valores faltantes
+    """
+    # Leer archivo comprimido y crear copia para evitar warnings
+    df = pd.read_csv(ruta_zip, compression="zip").copy()
+    
+    # Renombrar columna de target a nombre más simple
+    df.rename(columns={"default payment next month": "default"}, inplace=True)
+    
+    # Eliminar columna de ID (no es predictiva)
+    if "ID" in df.columns:
+        df.drop(columns=["ID"], inplace=True)
+
+    # Filtrar registros con valores inválidos en MARRIAGE y EDUCATION
+    df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)].copy()
+    
+    # Agrupar valores de EDUCATION >= 4 en categoría 4
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda v: 4 if v >= 4 else v)
+    
+    # Retornar dataframe sin valores nulos
+    return df.dropna()
+
+
+def _metricas(etiqueta: str, y_true, y_pred) -> dict:
+    """
+    Calcula métricas de evaluación del modelo.
+    
+    Args:
+        etiqueta: Nombre del dataset (ej: 'train', 'test')
+        y_true: Valores reales
+        y_pred: Valores predichos
+        
+    Returns:
+        Diccionario con métricas de desempeño
+    """
+    return {
+        "type": "metrics",
+        "dataset": etiqueta,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
+    }
+
+
+def _matriz_conf(etiqueta: str, y_true, y_pred) -> dict:
+    """
+    Genera matriz de confusión en formato estructurado.
+    
+    Args:
+        etiqueta: Nombre del dataset
+        y_true: Valores reales
+        y_pred: Valores predichos
+        
+    Returns:
+        Diccionario con matriz de confusión desglosada
+    """
+    # Desempaquetar los componentes de la matriz de confusión
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    
+    return {
+        "type": "cm_matrix",
+        "dataset": etiqueta,
+        "true_0": {"predicted_0": int(tn), "predicted_1": int(fp)},
+        "true_1": {"predicted_0": int(fn), "predicted_1": int(tp)},
+    }
+
+
+def _construir_busqueda(vars_cat, vars_num) -> GridSearchCV:
+    """
+    Construye pipeline de ML con búsqueda de hiperparámetros.
+    
+    Args:
+        vars_cat: Lista de columnas categóricas
+        vars_num: Lista de columnas numéricas
+        
+    Returns:
+        GridSearchCV configurado con pipeline MLP
+    """
+    # Preprocesamiento: codificación One-Hot para categorías y escalado para números
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(), vars_cat),
+            ("num", StandardScaler(), vars_num),
+        ]
+    )
+
+    # Pipeline completo: preproceso -> selección de features -> PCA -> MLP
+    pipe = Pipeline(
+        steps=[
+            ("pre", pre),
+            ("selector", SelectKBest(score_func=f_classif)),
+            ("pca", PCA()),
+            ("mlp", MLPClassifier(max_iter=15000, random_state=21)),
+        ]
+    )
+
+    # Grilla de hiperparámetros para buscar
+    grid = {
+        "selector__k": [20],
+        "pca__n_components": [None],
+        "mlp__hidden_layer_sizes": [(50, 30, 40, 60)],
+        "mlp__alpha": [0.26],
+        "mlp__learning_rate_init": [0.001],
+    }
+
+    # Configurar búsqueda con validación cruzada de 10 folds
+    return GridSearchCV(
+        estimator=pipe,
+        param_grid=grid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        refit=True,
+    )
+
+
+def main() -> None:
+    """Función principal: entrena, evalúa y guarda el modelo MLP."""
+    
+    # Rutas de entrada
+    ruta_train = "files/input/train_data.csv.zip"
+    ruta_test = "files/input/test_data.csv.zip"
+
+    # Cargar y limpiar datos
+    df_tr = _cargar_y_limpia(ruta_train)
+    df_te = _cargar_y_limpia(ruta_test)
+
+    # Separar features (X) de target (y)
+    X_tr, y_tr = df_tr.drop(columns=["default"]), df_tr["default"]
+    X_te, y_te = df_te.drop(columns=["default"]), df_te["default"]
+
+    # Identificar columnas categóricas y numéricas
+    cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+    num_cols = [c for c in X_tr.columns if c not in cat_cols]
+
+    # Crear y entrenar modelo con búsqueda de hiperparámetros
+    search = _construir_busqueda(cat_cols, num_cols)
+    search.fit(X_tr, y_tr)
+
+    # Limpiar directorio de modelos anteriores
+    modelos_dir = Path("files/models")
+    if modelos_dir.exists():
+        for f in glob(str(modelos_dir / "*")):
+            os.remove(f)
+        try:
+            os.rmdir(modelos_dir)
+        except OSError:
+            pass
+    modelos_dir.mkdir(parents=True, exist_ok=True)
+
+    # Guardar modelo entrenado comprimido
+    with gzip.open(modelos_dir / "model.pkl.gz", "wb") as fh:
+        pickle.dump(search, fh)
+
+    # Realizar predicciones en train y test
+    y_tr_pred = search.predict(X_tr)
+    y_te_pred = search.predict(X_te)
+
+    # Calcular métricas y matrices de confusión
+    m_train = _metricas("train", y_tr, y_tr_pred)
+    m_test = _metricas("test", y_te, y_te_pred)
+    cm_train = _matriz_conf("train", y_tr, y_tr_pred)
+    cm_test = _matriz_conf("test", y_te, y_te_pred)
+
+    # Compilar resultados
+    salidas = [m_train, m_test, cm_train, cm_test]
+
+    # Guardar resultados en formato JSON (uno por línea)
+    out_dir = Path("files/output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
+        for registro in salidas:
+            f.write(json.dumps(registro) + "\n")
+
+
+if __name__ == "__main__":
+    main()
